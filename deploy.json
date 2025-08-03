@@ -1,77 +1,118 @@
 {
-  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
-  "parameters": {
-    "logicAppName": { "type": "string" },
-    "location": { "type": "string" },
-    "workspaceId": { "type": "string" },
-    "workspaceResourceId": { "type": "string" },
-    "recipientEmail": { "type": "string" },
-    "logAnalyticsReaderRoleDefinitionId": { "type": "string" }
-  },
-  "resources": [
-    {
-      "type": "Microsoft.Web/connections",
-      "apiVersion": "2016-06-01",
-      "name": "office365",
-      "location": "[parameters('location')]",
-      "properties": {
-        "displayName": "Office365-Outlook-Connection",
-        "api": {
-          "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', parameters('location'), '/managedApis/office365')]"
-        }
-      }
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "logicAppName": { "type": "string" },
+        "location": { "type": "string" },
+        "workspaceId": { "type": "string" },
+        "workspaceResourceId": { "type": "string" },
+        "recipientEmail": { "type": "string" },
+        "logAnalyticsReaderRoleDefinitionId": { "type": "string" }
     },
-    {
-      "type": "Microsoft.Logic/workflows",
-      "apiVersion": "2019-05-01",
-      "name": "[parameters('logicAppName')]",
-      "location": "[parameters('location')]",
-      "identity": { "type": "SystemAssigned" },
-      "dependsOn": [ "[resourceId('Microsoft.Web/connections', 'office365')]" ],
-      "properties": {
-        "state": "Enabled",
-        "definition": {
-          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-          "contentVersion": "1.0.0.0",
-          "parameters": {
-            "$connections": {
-              "defaultValue": {},
-              "type": "Object"
+    "resources": [
+        {
+            "type": "Microsoft.Web/connections",
+            "apiVersion": "2016-06-01",
+            "name": "office365",
+            "location": "[parameters('location')]",
+            "properties": {
+                "displayName": "Office365-Outlook-Connection",
+                "api": { "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', parameters('location'), '/managedApis/office365')]" }
             }
-          },
-          "triggers": {
-            "Recurrence": {
-              "type": "Recurrence",
-              "recurrence": {
-                "frequency": "Day",
-                "interval": 1
-              }
-            }
-          },
-          "actions": {
-            "HTTP_Query_SigninLogs": {
-              "type": "Http",
-              "inputs": {
-                "uri": "[concat('https://api.loganalytics.io/v1/workspaces/', parameters('workspaceId'), '/query')]",
-                "method": "POST",
-                "headers": {
-                  "Content-Type": "application/json"
+        },
+        {
+            "type": "Microsoft.Logic/workflows",
+            "apiVersion": "2019-05-01",
+            "name": "[parameters('logicAppName')]",
+            "location": "[parameters('location')]",
+            "identity": { "type": "SystemAssigned" },
+            "dependsOn": [ "[resourceId('Microsoft.Web/connections', 'office365')]" ],
+            "properties": {
+                "state": "Enabled",
+                "definition": {
+                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": { "$connections": { "defaultValue": {}, "type": "Object" } },
+                    "triggers": { "Recurrence": { "type": "Recurrence", "recurrence": { "frequency": "Day", "interval": 1 } } },
+                    "actions": {
+                        "HTTP_Query_SigninLogs": {
+                            "type": "Http",
+                            "inputs": {
+                                "uri": "[concat('https://api.loganalytics.io/v1/workspaces/', parameters('workspaceId'), '/query')]",
+                                "method": "POST",
+                                "headers": { "Content-Type": "application/json" },
+                                "body": { "query": "SigninLogs | where TimeGenerated > ago(1d) | summarize FailureCount=countif(ResultType != 0), SuccessCount=countif(ResultType == 0), Total=count() by UserPrincipalName | order by FailureCount desc" },
+                                "authentication": {
+                                    "type": "ManagedServiceIdentity",
+                                    "audience": "https://api.loganalytics.io"
+                                }
+                            }
+                        },
+                        "Create_HTML_Table": {
+                            "type": "Table",
+                            "inputs": {
+                                "from": "@body('HTTP_Query_SigninLogs')?.tables[0].rows",
+                                "format": "Html",
+                                "columns": [
+                                    {
+                                        "header": "User Principal Name",
+                                        "value": "@item()[0]"
+                                    },
+                                    {
+                                        "header": "Failure Count",
+                                        "value": "@item()[1]"
+                                    },
+                                    {
+                                        "header": "Success Count",
+                                        "value": "@item()[2]"
+                                    },
+                                    {
+                                        "header": "Total Count",
+                                        "value": "@item()[3]"
+                                    }
+                                ]
+                            },
+                            "runAfter": { "HTTP_Query_SigninLogs": [ "Succeeded" ] }
+                        },
+                        "Send_an_email_V2": {
+                            "type": "ApiConnection",
+                            "inputs": {
+                                "host": { "connection": { "name": "@parameters('$connections')['office365']['connectionId']" } },
+                                "method": "post", "path": "/v2/Mail",
+                                "body": {
+                                    "To": "[parameters('recipientEmail')]",
+                                    "Subject": "[Daily] Entra ID Sign-in Activity - @{utcNow('yyyy-MM-dd')}",
+                                    "Body": "안녕하세요,<p>지난 24시간 동안의 Entra ID 로그인 활동 요약 보고서입니다.</p>@{outputs('Create_HTML_Table')}",
+                                    "Importance": "Normal"
+                                }
+                            },
+                            "runAfter": { "Create_HTML_Table": [ "Succeeded" ] }
+                        }
+                    }
                 },
-                "body": {
-                  "query": "SigninLogs | where TimeGenerated > ago(1d) | summarize FailureCount=countif(ResultType != 0), SuccessCount=countif(ResultType == 0), Total=count() by UserPrincipalName | order by FailureCount desc"
-                },
-                "authentication": {
-                  "type": "ManagedServiceIdentity",
-                  "audience": "https://api.loganalytics.io"
+                "parameters": {
+                    "$connections": {
+                        "value": {
+                            "office365": {
+                                "connectionId": "[resourceId('Microsoft.Web/connections', 'office365')]", "connectionName": "office365",
+                                "id": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', parameters('location'), '/managedApis/office365')]"
+                            }
+                        }
+                    }
                 }
-              }
+            }
+        },
+        {
+            "type": "Microsoft.Authorization/roleAssignments",
+            "apiVersion": "2022-04-01",
+            "name": "[guid(resourceGroup().id, parameters('logicAppName'), 'LogAnalyticsReader')]",
+            "dependsOn": [ "[resourceId('Microsoft.Logic/workflows', parameters('logicAppName'))]" ],
+            "properties": {
+                "roleDefinitionId": "[parameters('logAnalyticsReaderRoleDefinitionId')]",
+                "principalId": "[reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'Full').identity.principalId]",
+                "principalType": "ServicePrincipal"
             },
-            "Create_HTML_Table": {
-              "type": "Table",
-              "inputs": {
-                "from": "@body('HTTP_Query_SigninLogs')?.tables[0].rows",
-                "format": "html",
-                "columns": [
-                  {
-
+            "scope": "[parameters('workspaceResourceId')]"
+        }
+    ]
+}
